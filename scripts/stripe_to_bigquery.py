@@ -58,6 +58,82 @@ except Exception as e:
     print(f"   2. Run: gcloud auth application-default login")
     raise e
 
+# SQL file directory
+SQL_DIR = Path(__file__).parent.parent / 'sql'
+
+
+def load_sql_file(filename: str, **kwargs) -> str:
+    """
+    Load a SQL file from the sql/ directory and substitute placeholders.
+    
+    Args:
+        filename: Name of the SQL file (e.g., 'mrr_monthly_metrics.sql')
+        **kwargs: Additional variables to substitute (beyond PROJECT_ID and DATASET_ID)
+    
+    Returns:
+        SQL query string with placeholders substituted
+    
+    Example:
+        query = load_sql_file('mrr_monthly_metrics.sql')
+    """
+    sql_path = SQL_DIR / filename
+    
+    if not sql_path.exists():
+        raise FileNotFoundError(f"SQL file not found: {sql_path}")
+    
+    with open(sql_path, 'r') as f:
+        sql_content = f.read()
+    
+    # Substitute standard placeholders
+    sql_content = sql_content.replace('{PROJECT_ID}', PROJECT_ID)
+    sql_content = sql_content.replace('{DATASET_ID}', DATASET_ID)
+    
+    # Substitute any additional placeholders
+    for key, value in kwargs.items():
+        sql_content = sql_content.replace(f'{{{key}}}', str(value))
+    
+    return sql_content
+
+
+def load_sql_queries_from_file(filename: str) -> Dict[str, str]:
+    """
+    Load multiple named SQL queries from a single file.
+    
+    Queries are delimited by comments like:
+    -- QUERY: query_name
+    
+    Args:
+        filename: Name of the SQL file containing multiple queries
+    
+    Returns:
+        Dictionary mapping query names to their SQL content
+    """
+    sql_content = load_sql_file(filename)
+    queries = {}
+    current_query_name = None
+    current_query_lines = []
+    
+    for line in sql_content.split('\n'):
+        # Check for query delimiter
+        if line.strip().upper().startswith('-- QUERY:'):
+            # Save previous query if exists
+            if current_query_name:
+                queries[current_query_name] = '\n'.join(current_query_lines).strip()
+            # Start new query
+            current_query_name = line.split(':', 1)[1].strip().lower()
+            current_query_lines = []
+        elif current_query_name:
+            # Skip comment lines that describe the query
+            if not (line.strip().startswith('-- ') and line.strip().endswith('=')):
+                current_query_lines.append(line)
+    
+    # Save last query
+    if current_query_name:
+        queries[current_query_name] = '\n'.join(current_query_lines).strip()
+    
+    return queries
+
+
 class StripeToBigQueryPipeline:
     """
     Pipeline to extract Stripe MRR data and load into BigQuery.
@@ -65,6 +141,7 @@ class StripeToBigQueryPipeline:
     
     def __init__(self):
         self.dataset_ref = bq_client.dataset(DATASET_ID, project=PROJECT_ID)
+        self.sql_dir = SQL_DIR
         self.tables = {
             'customers': 'customers',
             'subscriptions': 'subscriptions', 
@@ -640,99 +717,10 @@ class StripeToBigQueryPipeline:
     def calculate_mrr_metrics(self):
         """Calculate MRR summary metrics and store in BigQuery."""
         print("\n📊 Calculating MRR metrics...")
+        print(f"   Loading query from: sql/mrr_monthly_metrics.sql")
         
-        # SQL query to calculate monthly MRR metrics
-        # This creates a month series and checks which subscriptions were active during each month
-        # Key logic: A subscription contributes to MRR if it started before month end AND 
-        # (hasn't been canceled OR was canceled after month start)
-        mrr_query = f"""
-        WITH 
-        -- Generate a series of months from the earliest subscription to now
-        date_range AS (
-          SELECT MIN(DATE(start_date)) as min_date, CURRENT_DATE() as max_date
-          FROM `{PROJECT_ID}.{DATASET_ID}.subscriptions`
-        ),
-        
-        months AS (
-          SELECT month_start
-          FROM date_range,
-          UNNEST(GENERATE_DATE_ARRAY(
-            DATE_TRUNC(min_date, MONTH),
-            DATE_TRUNC(max_date, MONTH),
-            INTERVAL 1 MONTH
-          )) as month_start
-        ),
-        
-        -- For each month, determine which subscriptions were active
-        monthly_subscriptions AS (
-          SELECT 
-            m.month_start as month_start_date,
-            FORMAT_DATE('%Y-%m', m.month_start) as month_year,
-            s.customer_id,
-            s.subscription_id,
-            s.status,
-            s.mrr_amount,
-            s.start_date,
-            s.canceled_at,
-            s.ended_at,
-            -- A subscription is active in a month if:
-            -- 1. It started on or before the end of the month
-            -- 2. It hasn't been canceled OR was canceled after the END of the month
-            -- (if canceled during the month, it shouldn't count for that month's MRR)
-            CASE 
-              WHEN DATE(s.start_date) <= DATE_ADD(m.month_start, INTERVAL 1 MONTH)
-                AND (s.canceled_at IS NULL OR DATE(s.canceled_at) >= DATE_ADD(m.month_start, INTERVAL 1 MONTH))
-              THEN TRUE
-              ELSE FALSE
-            END as was_active_in_month
-          FROM months m
-          CROSS JOIN `{PROJECT_ID}.{DATASET_ID}.subscriptions` s
-        ),
-        
-        monthly_metrics AS (
-          SELECT 
-            month_year,
-            month_start_date,
-            SUM(CASE WHEN was_active_in_month THEN mrr_amount ELSE 0 END) as total_mrr,
-            COUNT(DISTINCT CASE WHEN was_active_in_month THEN customer_id END) as active_customers,
-            COUNT(DISTINCT CASE WHEN DATE(start_date) >= month_start_date 
-                                   AND DATE(start_date) < DATE_ADD(month_start_date, INTERVAL 1 MONTH)
-                                   THEN customer_id END) as new_customers,
-            COUNT(DISTINCT CASE WHEN canceled_at IS NOT NULL
-                                   AND DATE(canceled_at) >= month_start_date 
-                                   AND DATE(canceled_at) < DATE_ADD(month_start_date, INTERVAL 1 MONTH) 
-                                   THEN customer_id END) as churned_customers,
-            SUM(CASE WHEN DATE(start_date) >= month_start_date 
-                          AND DATE(start_date) < DATE_ADD(month_start_date, INTERVAL 1 MONTH)
-                          THEN mrr_amount ELSE 0 END) as new_mrr,
-            SUM(CASE WHEN canceled_at IS NOT NULL
-                          AND DATE(canceled_at) >= month_start_date 
-                          AND DATE(canceled_at) < DATE_ADD(month_start_date, INTERVAL 1 MONTH) 
-                          THEN mrr_amount ELSE 0 END) as churned_mrr
-          FROM monthly_subscriptions
-          GROUP BY month_year, month_start_date
-        )
-        
-        SELECT 
-          month_year,
-          month_start_date,
-          total_mrr,
-          new_mrr,
-          0.0 as expansion_mrr,
-          0.0 as contraction_mrr,
-          churned_mrr,
-          (new_mrr - churned_mrr) as net_new_mrr,
-          active_customers,
-          new_customers,
-          churned_customers,
-          SAFE_DIVIDE(total_mrr, active_customers) as average_revenue_per_user,
-          SAFE_DIVIDE(churned_customers, active_customers) as churn_rate,
-          LAG(total_mrr) OVER (ORDER BY month_start_date) as prev_month_mrr,
-          CURRENT_TIMESTAMP() as calculated_at
-        FROM monthly_metrics
-        WHERE active_customers > 0 OR new_customers > 0 OR churned_customers > 0
-        ORDER BY month_start_date
-        """
+        # Load SQL query from external file
+        mrr_query = load_sql_file('mrr_monthly_metrics.sql')
         
         # Execute query and load results
         try:
@@ -778,93 +766,10 @@ class StripeToBigQueryPipeline:
     def calculate_cohort_analysis(self):
         """Calculate customer cohort retention analysis and store in BigQuery."""
         print("\n📊 Calculating cohort analysis...")
+        print(f"   Loading query from: sql/cohort_analysis.sql")
         
-        # SQL query to calculate cohort retention
-        cohort_query = f"""
-        WITH 
-        -- Get cohort month for each customer (first subscription start)
-        customer_cohorts AS (
-          SELECT 
-            customer_id,
-            DATE_TRUNC(MIN(DATE(start_date)), MONTH) as cohort_start_date,
-            FORMAT_DATE('%Y-%m', MIN(DATE(start_date))) as cohort_month
-          FROM `{PROJECT_ID}.{DATASET_ID}.subscriptions`
-          GROUP BY customer_id
-        ),
-        
-        -- Generate month series
-        date_range AS (
-          SELECT MIN(cohort_start_date) as min_date, CURRENT_DATE() as max_date
-          FROM customer_cohorts
-        ),
-        
-        months AS (
-          SELECT month_start
-          FROM date_range,
-          UNNEST(GENERATE_DATE_ARRAY(
-            DATE_TRUNC(min_date, MONTH),
-            DATE_TRUNC(max_date, MONTH),
-            INTERVAL 1 MONTH
-          )) as month_start
-        ),
-        
-        -- For each cohort and period, calculate retention
-        cohort_periods AS (
-          SELECT 
-            cc.cohort_month,
-            cc.cohort_start_date,
-            m.month_start,
-            DATE_DIFF(m.month_start, cc.cohort_start_date, MONTH) as period_number,
-            cc.customer_id
-          FROM customer_cohorts cc
-          CROSS JOIN months m
-          WHERE m.month_start >= cc.cohort_start_date
-        ),
-        
-        -- Check if customer was active in each period
-        cohort_activity AS (
-          SELECT 
-            cp.cohort_month,
-            cp.cohort_start_date,
-            cp.period_number,
-            cp.customer_id,
-            CASE 
-              WHEN EXISTS (
-                SELECT 1 FROM `{PROJECT_ID}.{DATASET_ID}.subscriptions` s
-                WHERE s.customer_id = cp.customer_id
-                  AND DATE(s.start_date) <= DATE_ADD(cp.month_start, INTERVAL 1 MONTH)
-                  AND (s.canceled_at IS NULL OR DATE(s.canceled_at) >= cp.month_start)
-              ) THEN 1 ELSE 0
-            END as is_active
-          FROM cohort_periods cp
-        ),
-        
-        -- Aggregate by cohort and period
-        cohort_summary AS (
-          SELECT 
-            cohort_month,
-            cohort_start_date,
-            period_number,
-            COUNT(DISTINCT customer_id) as customers_in_cohort,
-            SUM(is_active) as active_customers
-          FROM cohort_activity
-          GROUP BY cohort_month, cohort_start_date, period_number
-        )
-        
-        SELECT 
-          cohort_month,
-          cohort_start_date,
-          period_number,
-          (SELECT COUNT(DISTINCT customer_id) FROM customer_cohorts WHERE cohort_month = cs.cohort_month) as customers_in_cohort,
-          active_customers,
-          SAFE_DIVIDE(active_customers, (SELECT COUNT(DISTINCT customer_id) FROM customer_cohorts WHERE cohort_month = cs.cohort_month)) as retention_rate,
-          0.0 as cohort_revenue,
-          0.0 as revenue_per_customer,
-          CURRENT_TIMESTAMP() as calculated_at
-        FROM cohort_summary cs
-        WHERE period_number <= 12  -- Limit to 12 months of retention
-        ORDER BY cohort_start_date, period_number
-        """
+        # Load SQL query from external file
+        cohort_query = load_sql_file('cohort_analysis.sql')
         
         try:
             query_job = bq_client.query(cohort_query)
@@ -896,64 +801,48 @@ class StripeToBigQueryPipeline:
     def generate_sample_queries(self):
         """Generate sample SQL queries for MRR analysis."""
         print("\n📝 Sample BigQuery queries for MRR analysis:")
+        print(f"   Queries loaded from: sql/mrr_queries.sql")
         
+        # Load queries from external SQL file
+        try:
+            queries = load_sql_queries_from_file('mrr_queries.sql')
+            
+            for query_name, query in queries.items():
+                print(f"\n-- {query_name.replace('_', ' ').title()}")
+                # Print first 10 lines of each query to keep output manageable
+                query_lines = query.strip().split('\n')
+                preview_lines = query_lines[:10]
+                print('\n'.join(preview_lines))
+                if len(query_lines) > 10:
+                    print(f"   ... ({len(query_lines) - 10} more lines)")
+                    
+        except FileNotFoundError:
+            print("   ⚠️  sql/mrr_queries.sql not found, using inline queries")
+            self._generate_inline_sample_queries()
+        except Exception as e:
+            print(f"   ⚠️  Error loading queries: {e}")
+            self._generate_inline_sample_queries()
+    
+    def _generate_inline_sample_queries(self):
+        """Fallback: generate inline sample queries if SQL files are unavailable."""
         queries = {
             "Current MRR by Plan": f"""
             SELECT 
               p.name as plan_name,
               pr.nickname as price_nickname,
               COUNT(DISTINCT s.customer_id) as customers,
-              SUM(s.mrr_amount) as total_mrr,
-              AVG(s.mrr_amount) as avg_mrr_per_customer
+              SUM(s.mrr_amount) as total_mrr
             FROM `{PROJECT_ID}.{DATASET_ID}.subscriptions` s
             JOIN `{PROJECT_ID}.{DATASET_ID}.prices` pr ON s.price_id = pr.price_id
             JOIN `{PROJECT_ID}.{DATASET_ID}.products` p ON s.product_id = p.product_id
             WHERE s.status = 'active'
-            GROUP BY p.name, pr.nickname, pr.unit_amount
+            GROUP BY p.name, pr.nickname
             ORDER BY total_mrr DESC
             """,
-            
             "MRR Growth Trend": f"""
-            SELECT 
-              month_year,
-              total_mrr,
-              new_mrr,
-              churned_mrr,
-              net_new_mrr,
-              growth_rate,
-              active_customers,
-              churn_rate
+            SELECT month_year, total_mrr, new_mrr, churned_mrr, growth_rate
             FROM `{PROJECT_ID}.{DATASET_ID}.mrr_monthly_summary`
             ORDER BY month_start_date
-            """,
-            
-            "Customer Churn Analysis": f"""
-            SELECT 
-              DATE_TRUNC(DATE(canceled_at), MONTH) as churn_month,
-              COUNT(*) as churned_customers,
-              SUM(mrr_amount) as churned_mrr,
-              AVG(DATE_DIFF(DATE(canceled_at), DATE(start_date), DAY)) as avg_lifetime_days
-            FROM `{PROJECT_ID}.{DATASET_ID}.subscriptions`
-            WHERE status = 'canceled' AND canceled_at IS NOT NULL
-            GROUP BY churn_month
-            ORDER BY churn_month
-            """,
-            
-            "Revenue by Collection Method": f"""
-            SELECT 
-              s.collection_method,
-              COUNT(DISTINCT s.customer_id) as customers,
-              SUM(s.mrr_amount) as total_mrr,
-              COUNT(DISTINCT i.invoice_id) as total_invoices,
-              COUNT(DISTINCT CASE WHEN i.status = 'paid' THEN i.invoice_id END) as paid_invoices,
-              SAFE_DIVIDE(
-                COUNT(DISTINCT CASE WHEN i.status = 'paid' THEN i.invoice_id END),
-                COUNT(DISTINCT i.invoice_id)
-              ) * 100 as payment_success_rate
-            FROM `{PROJECT_ID}.{DATASET_ID}.subscriptions` s
-            LEFT JOIN `{PROJECT_ID}.{DATASET_ID}.invoices` i ON s.subscription_id = i.subscription_id
-            WHERE s.status IN ('active', 'past_due')
-            GROUP BY s.collection_method
             """
         }
         
