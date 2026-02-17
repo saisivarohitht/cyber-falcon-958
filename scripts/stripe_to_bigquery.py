@@ -28,7 +28,7 @@ stripe_client = stripe.StripeClient(api_key=os.getenv('STRIPE_TEST_SECRET_KEY'))
 
 # Configuration
 PROJECT_ID = os.getenv('GOOGLE_CLOUD_PROJECT_ID', 'your-project-id')
-DATASET_ID = os.getenv('BQ_DATASET_ID', 'stripe_mrr_v2')
+DATASET_ID = os.getenv('BQ_DATASET_ID', 'stripe_data')
 LOCATION = os.getenv('BQ_LOCATION', 'US')
 
 # BigQuery setup - Use GOOGLE_APPLICATION_CREDENTIALS from .env
@@ -845,10 +845,6 @@ class StripeToBigQueryPipeline:
             ORDER BY month_start_date
             """
         }
-        
-        for query_name, query in queries.items():
-            print(f"\n-- {query_name}")
-            print(query)
     
     def run_full_pipeline(self):
         """Execute the complete Stripe to BigQuery pipeline."""
