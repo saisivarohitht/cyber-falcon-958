@@ -1,0 +1,53 @@
+# Environment variables (contains secrets!)
+.env
+*.env.local
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Node modules
+node_modules/
+frontend/node_modules/
+
+# Build outputs
+dist/
+build/
+*.egg-info/
+
+# Google Cloud credentials (NEVER commit these!)
+*.json
+!package.json
+!package-lock.json
+google-cloud-key*.json
+service-account*.json
+
+# Logs and temp files
+*.log
+data/
+output/
+tmp/
+temp/
+
+# Generated files (except docs/images)
+mrr_trend_chart.png
+screenshot.png

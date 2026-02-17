@@ -186,16 +186,17 @@ flowchart TB
     end
     
     subgraph Data["sql/"]
-        MRR["mrr_calculation.sql"]
+        MRR["mrr_monthly_metrics.sql"]
+        COH["cohort_analysis.sql"]
         QRY["mrr_queries.sql"]
     end
     
     App --> MC
     App --> Charts
     Vite -->|proxy /api| API
-    API -->|uses| MRR
     API -->|uses| QRY
-    ETL -->|creates| MRR
+    ETL -->|uses| MRR
+    ETL -->|uses| COH
 ```
 
 ## 6. Data Model (ERD)
